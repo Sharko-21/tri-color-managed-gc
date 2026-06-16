@@ -1,0 +1,13 @@
+[package]
+name = "managed_gc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "gc_benchmark"
+harness = false
