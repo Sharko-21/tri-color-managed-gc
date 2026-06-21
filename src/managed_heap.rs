@@ -1,219 +1,201 @@
-use crate::allocator::Allocator;
-use crate::bump_allocator::BumpAllocator;
-use crate::datastruct::{AllocError, ManagedObject, ObjectHeader, ObjectId, OBJECT_HEADER_SIZE, OBJECT_ID_SIZE};
+//! Модуль управляемой кучи (Managed Heap).
+//!
+//! `ManagedHeap` представляет собой единый непрерывный массив байт, в котором выделяются
+//! спаны (`MSpan`) под объекты управляемого рантайма. Он отвечает только за выделение
+//! новых регионов памяти (спанов) и низкоуровневое чтение/запись слотов по их `ObjectId`.
+//! Непосредственным размещением объектов внутри спанов занимаются `MCache` и `MCentral`.
+use std::cell::UnsafeCell;
+use std::sync::{Arc, Mutex};
+use crate::datastruct::{AllocError, ManagedObject, ObjectId, TypeDescriptor, OBJ_HEADER_SIZE, PAGE_SIZE};
+use crate::mspan::{MSpan, MSpanSizeClass};
 
-
-/// Высокоуровневая прослойка (Facade) над плоской бинарной кучей.
+/// Управляемая куча — центральное хранилище всех объектов рантайма.
 ///
-/// `ManagedHeap` — это единственная точка входа для приложения при работе с управляемой памятью.
-/// Она скрывает за собой низкоуровневый аллокатор (сейчас `BumpAllocator`) и берёт на себя
-/// всю сериализацию/десериализацию объектов: запись заголовка, массива ссылок и payload
-/// в сырые байты кучи, а также обратное чтение в безопасную структуру `ManagedObject`.
+/// ## Потокобезопасность
 ///
-/// # Разделение ответственности
-///
-/// - **Allocator** (например, `BumpAllocator`) отвечает только за управление памятью:
-///   выделение блока, чтение и обновление заголовка, проверка границ.
-/// - **ManagedHeap** отвечает за наполнение выделенного блока данными:
-///   копирование массива ссылок и payload в нужные смещения относительно заголовка.
-///
-/// Такой подход позволяет в будущем заменить `BumpAllocator` на более сложный аллокатор
-/// (например, с дефрагментацией или поколенческой сборкой), не меняя логику сериализации.
+/// Структура реализует `Sync` и `Send` вручную (см. unsafe impl блоки).
+/// Это разрешено, потому что:
+/// - Чтение/запись данных происходит через атомарные операции в спанах (`MSpan`)
+///   и синхронизируется на уровне аллокатора.
+/// - Метаданные (`HeapMeta`) защищены собственным `Mutex`.
+/// - Само тело кучи `memory` обёрнуто в `UnsafeCell`, чтобы Rust не накладывал
+///   ограничения на разделяемый доступ. Потенциальные гонки предотвращаются
+///   логикой аллокатора (один слот никогда не пишется параллельно).
 pub struct ManagedHeap {
-    allocator: BumpAllocator,
+    memory: UnsafeCell<Vec<u8>>,
+    memory_size: usize,
+    meta: Mutex<HeapMeta>,
 }
 
+pub struct HeapMeta {
+    /// Абсолютное смещение в memory откуда мы будем доставать следующую страницу для нового MSpan
+    pub next_page_offset: usize,
+    /// Карта страниц: индекс — номер страницы (смещение / 4096), значение —
+    /// ссылка на `MSpan`, который управляет этой страницей. Одна страница может
+    /// принадлежать только одному спану, но спан может занимать несколько страниц.
+    pub page_map: Vec<Option<Arc<MSpan>>>,
+}
+
+// SAFETY: Доступ к `memory` синхронизирован логически на уровне спанов и Mutex.
+//         Одновременное чтение разных слотов безопасно, запись — защищена аллокатором.
+unsafe impl Sync for ManagedHeap {}
+unsafe impl Send for ManagedHeap {}
+
 impl ManagedHeap {
-    /// Создаёт новую управляемую кучу заданного размера.
-    ///
-    /// # Что происходит
-    ///
-    /// 1. Под капотом создаётся `Vec<u8>` ёмкостью `heap_size` байт,
-    ///    заполненный нулями — это наша плоская бинарная куча.
-    /// 2. Указатель следующей аллокации (`next`) устанавливается в `0`.
-    ///
-    /// # Аргументы
-    ///
-    /// - `heap_size` — общий размер кучи в байтах. Вся последующая работа
-    ///   с памятью ограничена этим объёмом. При попытке выделить больше
-    ///   аллокатор вернёт `AllocError::OutOfMemory`.
-    ///
-    /// # Пример
-    ///
-    /// ```ignore
-    /// let mut heap = ManagedHeap::new(256);
-    /// ```
     pub fn new(heap_size: usize) -> Self {
-        Self {allocator: BumpAllocator::new(heap_size)}
+        // Искусственно «откусываем» первые 4096 байт, чтобы смещение 0
+        // никогда не досталось живому объекту и гарантированно означало None
+        // Гарантируем, что куча как минимум больше одной страницы
+        assert!(heap_size > PAGE_SIZE, "Размер кучи должен быть больше 4096 байт");
+
+        Self {
+            memory: UnsafeCell::new(vec![0u8; heap_size]),
+            memory_size: heap_size,
+            meta: Mutex::new(HeapMeta {
+                // Начинаем строго с 4096! Первая страница (0..4096) остается пустой.
+                next_page_offset: PAGE_SIZE,
+                page_map: vec![None; (heap_size / PAGE_SIZE) + 1],
+            }),
+        }
     }
-    /// Сериализует управляемый объект в кучу и возвращает его идентификатор.
+
+    /// Выделяет новый спан заданного класса размеров, «откусывая» необходимый
+    /// непрерывный участок кучи.
     ///
-    /// Метод принимает высокоуровневое представление объекта (`ManagedObject`),
-    /// выделяет под него непрерывный блок памяти через аллокатор и копирует
-    /// все данные (заголовок уже записан аллокатором, ссылки и payload дописываем здесь)
-    /// в сырые байты кучи.
-    ///
-    /// # Структура блока после записи
-    ///
-    /// После успешной записи по смещению `object_id.0` в куче лежит:
-    /// ```text
-    /// [ObjectHeader (40 байт)] [References: ObjectId × refs_count] [Payload: aligned_payload байт]
-    /// ```
-    ///
-    /// Где:
-    /// - **ObjectHeader** — уже записан аллокатором на этапе `alloc`.
-    /// - **References** — копия `obj.references` (массив `ObjectId`).
-    /// - **Payload** — копия `obj.payload` (сырые байты пользовательских данных).
-    ///
-    /// # Почему заголовок записывается отдельно от ссылок и payload?
-    ///
-    /// Это разделение ответственности: аллокатор (`BumpAllocator::alloc`) резервирует блок
-    /// и пишет только заголовок — ему не нужно знать про внутреннюю структуру данных.
-    /// А `ManagedHeap::write_object` уже знает, что за заголовком идут ссылки, а за ними —
-    /// полезные данные, и заполняет эти области.
-    ///
-    /// # Выравнивание
-    ///
-    /// Выравнивание payload до 8 байт уже выполнено аллокатором на этапе расчёта
-    /// `total_size` (формула `(payload_size + 7) & !7`). Здесь мы копируем ровно
-    /// `obj.payload.len()` байт — паддинговые байты остаются нулевыми (куча инициализирована нулями).
-    ///
-    /// # Безопасность unsafe-блока
-    ///
-    /// Внутри используется два вызова `std::ptr::copy_nonoverlapping`:
-    ///
-    /// 1. **Копирование ссылок**: пишет `refs_count` элементов `ObjectId`
-    ///    сразу за заголовком (смещение `OBJECT_HEADER_SIZE`).
-    /// 2. **Копирование payload**: пишет `payload_size` сырых байт
-    ///    сразу за массивом ссылок (смещение `OBJECT_HEADER_SIZE + refs_count * OBJECT_ID_SIZE`).
-    ///
-    /// Это безопасно, потому что:
-    /// - Аллокатор уже проверил, что в куче достаточно места для всего блока
-    ///   (иначе `alloc` вернул бы `Err` и мы бы не дошли до unsafe).
-    /// - Источники (`obj.references.as_ptr()`, `obj.payload.as_ptr()`) и назначения
-    ///   (смещения внутри кучи) гарантированно не пересекаются.
-    /// - Размеры копируемых областей не превышают границ выделенного блока.
-    ///
-    /// # Возвращаемое значение
-    ///
-    /// Возвращает `ObjectId` — смещение в байтах от начала кучи, по которому
-    /// был записан объект. Этот идентификатор можно использовать для чтения объекта
-    /// обратно через `read_object`.
+    /// Возвращает `Arc<MSpan>`, который автоматически регистрируется в карте страниц,
+    /// и на который затем могут ссылаться `MCache` и `MCentral`.
     ///
     /// # Ошибки
-    ///
-    /// Пробрасывает ошибки от аллокатора:
-    /// - `AllocError::OutOfMemory` — если в куче недостаточно свободного места.
-    pub fn write_object(&mut self, obj: &ManagedObject) -> Result<ObjectId, AllocError> {
-        let id: ObjectId = self.allocator.alloc(obj.references.len(), obj.payload.len())?;
-        let references_offset = OBJECT_HEADER_SIZE;
-        let base_ptr = self.allocator.get_object_ptr(id)?;
-        unsafe {
-            let references_ptr = base_ptr.add(references_offset) as *mut ObjectId;
-            std::ptr::copy_nonoverlapping(obj.references.as_ptr(), references_ptr, obj.references.len());
-
-            let refs_bytes_size = obj.references.len() * OBJECT_ID_SIZE;
-            let payload_ptr = base_ptr.add(OBJECT_HEADER_SIZE + refs_bytes_size);
-            std::ptr::copy_nonoverlapping(obj.payload.as_ptr(), payload_ptr, obj.payload.len());
-        }
-        Ok(id)
-    }
-
-    /// Десериализует объект из кучи по его идентификатору.
-    ///
-    /// Читает сырые байты по указанному смещению, интерпретирует заголовок,
-    /// а затем на основе его метаданных (`refs_count` и `payload_size`) вычитывает
-    /// массив ссылок и полезные данные, собирая всё в безопасную структуру `ManagedObject`.
-    ///
-    /// # Что происходит внутри
-    ///
-    /// 1. **Чтение заголовка**: через `allocator.read_header(object_id)` получаем `ObjectHeader`,
-    ///    из которого узнаём количество ссылок (`refs_count`) и размер payload (`payload_size`).
-    /// 2. **Чтение ссылок**: начиная со смещения `OBJECT_HEADER_SIZE` копируем
-    ///    `refs_count` элементов `ObjectId` во временный вектор.
-    /// 3. **Чтение payload**: начиная со смещения `OBJECT_HEADER_SIZE + refs_count * OBJECT_ID_SIZE`
-    ///    копируем `payload_size` сырых байт во временный вектор.
-    /// 4. **Сборка результата**: упаковываем всё в `ManagedObject` и возвращаем.
-    ///
-    /// # Формат чтения
-    ///
-    /// Чтение строго соответствует формату записи:
-    /// ```text
-    /// [ObjectHeader (40 байт)] [References: ObjectId × refs_count] [Payload: payload_size байт]
-    /// ```
-    ///
-    /// # Зачем нужно копировать данные из кучи, а не возвращать ссылку?
-    ///
-    /// Потому что наша куча — это `Vec<u8>`, а не арена с адресуемыми Rust-объектами.
-    /// Ссылка на байты внутри `Vec<u8>` была бы неудобна и опасна: мутация кучи
-    /// (новая аллокация) может вызвать реаллокацию `Vec`, инвалидируя ссылку.
-    /// Поэтому мы всегда копируем данные в свежий `ManagedObject` на стеке/куче приложения.
-    ///
-    /// # Безопасность unsafe-блока
-    ///
-    /// Два блока unsafe:
-    ///
-    /// 1. **Чтение ссылок**: `copy_nonoverlapping` копирует `refs_count * size_of::<ObjectId>()`
-    ///    байт из кучи в only-что-созданный `Vec<ObjectId>`. Безопасно, потому что:
-    ///    - `Vec::with_capacity` выделил ровно столько памяти, сколько нужно.
-    ///    - Проверка границ выполнена в `allocator.get_object_ptr` и `read_header`.
-    ///    - `set_len` корректен, так как байты по этому смещению валидны (записаны через `write_object`).
-    ///
-    /// 2. **Чтение payload**: аналогично, копирует ровно `payload_size` байт.
-    ///    Длина вектора payload устанавливается через `set_len` — это корректно, так как
-    ///    исходные байты в куче валидны и представляют собой массив `u8`.
-    ///
-    /// # Возвращаемое значение
-    ///
-    /// Возвращает `ManagedObject` — безопасную копию данных, извлечённых из кучи.
-    /// Векторы `references` и `payload` — независимые выделения памяти, не связанные с кучей.
-    ///
-    /// # Ошибки
-    ///
-    /// Пробрасывает ошибки от аллокатора:
-    /// - `AllocError::InvalidPointer` — если `object_id` указывает за границы кучи.
-    pub fn read_object(&mut self, object_id: ObjectId) -> Result<ManagedObject, AllocError> {
-        let header = self.allocator.read_header(object_id)?;
-        let base_ptr = self.allocator.get_object_ptr(object_id)?;
-
-        // Заполняем сначала references объекта
-        let references_offset = OBJECT_HEADER_SIZE;
-        let mut references: Vec<ObjectId> = Vec::with_capacity(header.refs_count);
-        unsafe {
-            let src_ptr = base_ptr.add(references_offset) as *const ObjectId;
-            std::ptr::copy_nonoverlapping(src_ptr, references.as_mut_ptr(), header.refs_count);
-            references.set_len(header.refs_count);
+    /// `AllocError::OutOfMemory` — если в куче недостаточно свободного места.
+    pub fn grow_span(&self, size_class: MSpanSizeClass) -> Result<Arc<MSpan>, AllocError> {
+        let mut meta = self.meta.lock().unwrap();
+        let bytes_needed = PAGE_SIZE * size_class.pages_per_span();
+        if meta.next_page_offset + bytes_needed > self.memory_size {
+            return Err(AllocError::OutOfMemory);
         }
 
-        // Теперь заполяем сами данные объекта
-        let mut payload: Vec<u8> = Vec::with_capacity(header.payload_size);
-        let payload_offset = references_offset + (header.refs_count * OBJECT_ID_SIZE);
-        unsafe {
-            let src_ptr = base_ptr.add(payload_offset);
-            std::ptr::copy_nonoverlapping(src_ptr, payload.as_mut_ptr(), header.payload_size);
-            payload.set_len(header.payload_size);
+        let span = Arc::new(MSpan::new(size_class, ObjectId(meta.next_page_offset)));
+
+        // Вычисляем, какие страницы памяти занял этот спан
+        let start_page_idx = meta.next_page_offset / PAGE_SIZE;
+        let end_page_idx = start_page_idx + size_class.pages_per_span();
+
+        // Регистрируем клон Arc в глобальной карте для каждой страницы спана
+        for i in start_page_idx..end_page_idx {
+            meta.page_map[i] = Some(Arc::clone(&span));
         }
 
-        Ok(ManagedObject{
-            id: object_id,
-            references,
-            payload,
-        })
+        meta.next_page_offset += bytes_needed;
+        Ok(span)
     }
 
-    pub fn read_header(&mut self, object_id: ObjectId) -> Result<ObjectHeader, AllocError> {
-        self.allocator.read_header(object_id)
+    /// Записывает переданный объект (`ManagedObject`) в слот кучи по заданному `ObjectId`.
+    ///
+    /// Этот метод **не проверяет** права на слот — предполагается, что вызывающая сторона
+    /// (аллокатор или GC) уже убедилась в его принадлежности.
+    ///
+    /// # Безопасность
+    /// Вызывающий должен гарантировать, что в этот слот не происходит параллельной записи.
+    pub fn write_to_slot(&self, obj_id: ObjectId, obj: &ManagedObject) {
+        unsafe {
+            // Извлекаем сырой указатель на мутабельный Vec
+            let vec_ptr = self.memory.get();
+            // Извлекаем абсолютный адрес из нашей структуры-обертки
+            let base_ptr = (*vec_ptr).as_mut_ptr().add(obj_id.0);
+
+            // 1. Записываем скрытый указатель на тип (первые 8 байт слота)
+            let type_slot = base_ptr as *mut *const TypeDescriptor;
+            type_slot.write(obj.type_desc_ptr);
+
+            // 2. Копируем payload (ссылки + данные) сразу за ним
+            let payload_dst = base_ptr.add(8);
+            std::ptr::copy_nonoverlapping(obj.payload.as_ptr(), payload_dst, obj.payload.len());
+        }
+    }
+    /// Читает метаданные и payload объекта из кучи по его `ObjectId`.
+    ///
+    /// Возвращает кортеж: (указатель на `TypeDescriptor`, срез байт payload).
+    ///
+    /// # Безопасность
+    /// Вызывающий должен гарантировать, что слот валиден и не будет параллельно изменён.
+    pub fn read_from_slot(&self, obj_id: ObjectId, size_class: MSpanSizeClass) -> (*const TypeDescriptor, &[u8]) {
+        unsafe {
+            let vec_ptr = self.memory.get();
+            let base_ptr = (*vec_ptr).as_ptr().add(obj_id.0);
+
+            let type_slot = base_ptr as *const *const TypeDescriptor;
+            let type_desc_ptr = type_slot.read();
+
+            // Получаем указатель на начало полезной нагрузки
+            let payload_ptr = base_ptr.add(OBJ_HEADER_SIZE);
+
+            // Размер payload — это размер всего блока минус 8 байт заголовка
+            let payload_len = size_class.block_size() - 8;
+
+            // 5. Формируем безопасный Rust-срез (slice) прямо поверх байт кучи
+            let payload_slice = std::slice::from_raw_parts(payload_ptr, payload_len);
+
+            (type_desc_ptr, payload_slice)
+        }
     }
 
-    pub fn update_header(&mut self, header: ObjectHeader) -> Result<(), AllocError> {
-        self.allocator.update_header(header.id, header)
+    /// Возвращает количество ссылочных полей (`refs_count`), объявленное в дескрипторе
+    /// типа объекта. Используется сборщиком мусора во время обхода графа.
+    pub fn read_refs_count(&self, obj_id: ObjectId) -> usize {
+        unsafe {
+            let vec_ptr = self.memory.get();
+            let base_ptr = (*vec_ptr).as_ptr().add(obj_id.0);
+
+            let type_slot = base_ptr as *const *const TypeDescriptor;
+            let type_desc_ptr = type_slot.read();
+            (*type_desc_ptr).refs_count
+        }
     }
 
-    pub fn read_references(&mut self, object_id: ObjectId) -> Result<Vec<ObjectId>, AllocError> {
-        self.allocator.read_references(object_id)
+    /// Читает массив ссылок (`ObjectId`), хранящихся в первых `refs_count` восьмибайтовых
+    /// полях payload-области. Используется GC при обходе достижимых объектов.
+    pub fn read_references(&self, obj_id: ObjectId) -> &[u64] {
+        let refs_count = self.read_refs_count(obj_id);
+        unsafe {
+            let vec_ptr = self.memory.get();
+            let base_ptr = (*vec_ptr).as_ptr().add(obj_id.0);
+            let payload_ptr = base_ptr.add(OBJ_HEADER_SIZE);
+            std::slice::from_raw_parts(payload_ptr as *const u64, refs_count)
+        }
     }
 
-    pub fn over_next(&self, object_id: ObjectId) -> bool {
-        self.allocator.over_next(object_id)
+    /// Записывает новое значение ссылки в указанное поле объекта (по индексу).
+    ///
+    /// Используется, например, при перемещении объектов (write barrier).
+    /// Вызывающий должен гарантировать корректность индекса.
+    pub fn write_reference(&self, obj_id: ObjectId, field_index: usize, new_ref: ObjectId) {
+        unsafe {
+            let vec_ptr: *mut Vec<u8> = self.memory.get();
+            let data_ptr: *mut u8 = (*vec_ptr).as_mut_ptr();
+            let byte_offset = obj_id.0 + OBJ_HEADER_SIZE + (field_index * 8);
+            let payload_ptr_u8 = data_ptr.add(byte_offset);
+            let target_ptr = payload_ptr_u8 as *mut ObjectId;
+            // for write barrier
+            // let old_ref = target_ptr.read();
+            target_ptr.write(new_ref);
+        }
+    }
+
+    /// Возвращает количество записей в карте страниц (отладочная/вспомогательная функция).
+    pub fn get_page_map_len(&self) -> usize {
+        let meta = self.meta.lock().unwrap();
+        meta.page_map.len()
+    }
+
+    /// Возвращает `Arc<MSpan>`, управляющий страницей с заданным индексом.
+    ///
+    /// Используется GC и аллокатором для поиска спана по `ObjectId` через номер страницы.
+    pub fn get_span_for_page(&self, page_idx: usize) -> Option<Arc<MSpan>> {
+        let meta = self.meta.lock().unwrap();
+        if page_idx < meta.page_map.len() {
+            meta.page_map[page_idx].clone() // Клонируем Arc, увеличивая счетчик ссылок
+        } else {
+            None
+        }
     }
 }

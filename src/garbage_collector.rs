@@ -1,119 +1,109 @@
-use crate::datastruct::{AllocError, GcColor, ObjectId};
-use crate::datastruct::GcColor::{Black, Grey, White};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use crate::datastruct::{ObjectId, PAGE_SIZE};
 use crate::managed_heap::ManagedHeap;
+use crate::mcentral::MCentral;
 
 pub struct GarbageCollector {
     worklist: Vec<ObjectId>,
+    is_marking: AtomicBool,
+    barrier_worklist: Mutex<Vec<ObjectId>>,
 }
 
-/// Реализация трёхцветного сборщика мусора (Tri-color Mark & Sweep).
-///
-/// `GarbageCollector` реализует классический алгоритм трассирующей сборки мусора,
-/// который определяет достижимость объектов, начиная с набора корневых ссылок (roots),
-/// и утилизирует недостижимые объекты.
-///
-/// # Трёхцветная абстракция (Tri-color Abstraction)
-///
-/// Алгоритм использует три цвета для маркировки объектов в процессе обхода графа:
-///
-/// - **White (Белый)**: Объект ещё не был обнаружен сборщиком. Если к концу фазы
-///   трассировки объект остаётся белым — он недостижим из корней и подлежит очистке.
-/// - **Grey (Серый)**: Объект обнаружен (достижим из корней), но его исходящие ссылки
-///   ещё не просканированы. Серые объекты формируют рабочий фронт (worklist) для обхода.
-/// - **Black (Чёрный)**: Объект и все его исходящие ссылки полностью просканированы.
-///   Чёрные объекты гарантированно живы и не требуют повторного визита.
-///
-/// # Инварианты алгоритма
-///
-/// 1. На каждом шаге трассировки ни один чёрный объект не указывает на белый.
-/// 2. Все серые объекты находятся в рабочем списке (`worklist`) и ждут обработки.
-/// 3. После завершения фазы `trace` серых объектов не остаётся — все живые объекты
-///    становятся чёрными, а недостижимые остаются белыми.
-///
-/// # Фазы сборки
-///
-/// Полный цикл сборки состоит из трёх последовательных фаз:
-///
-/// 1. **Инициализация (Initialize)** — все корневые объекты окрашиваются в серый
-///    и помещаются в рабочий список.
-/// 2. **Трассировка (Trace)** — итеративный обход графа: для каждого серого объекта
-///    его дочерние ссылки красятся в серый, а сам объект — в чёрный.
-/// 3. **Очистка (Sweep)** — линейный проход по всей куче: белые объекты признаются
-///    мусором (их связи обнуляются), чёрные возвращаются в белый цвет для следующего цикла.
-///
-/// # Ограничения текущей реализации
-///
-/// - Сборка выполняется полностью синхронно (Stop-The-World). Конкурентная версия
-///   потребует внедрения write barrier и фоновых потоков.
-/// - Bump-аллокатор не умеет переиспользовать память, освобождённую в фазе sweep.
-///   Освобождённые объекты лишь обнуляют свои ссылки, но блоки памяти остаются занятыми.
-///   Для реального переиспользования необходим free-list аллокатор или компактификация.
 impl GarbageCollector {
-    pub fn new() -> Self {
-        return Self { worklist: Vec::new() };
+    pub fn new() -> GarbageCollector {
+        GarbageCollector { worklist: Vec::new(), is_marking: AtomicBool::new(false), barrier_worklist: Mutex::new(Vec::new()) }
     }
 
-    pub fn initialize(&mut self, managed_heap: &mut ManagedHeap, roots: &[ObjectId]) -> Result<(), AllocError> {
-        for root_id in roots {
-            let mut header = managed_heap.read_header(*root_id)?;
-            if header.color != White {
-                continue;
-            }
-            header.color = GcColor::Grey;
-            managed_heap.update_header(header)?;
-            self.worklist.push(root_id.clone());
+    fn mark_object(&self, obj_id: ObjectId, heap: &ManagedHeap) -> bool {
+        let offset = obj_id.0;
+        // если по какой-то причине object_id ссылается на нашу служебную страницу (первая страница
+        // служит чисто в служебных целях)
+        if offset < PAGE_SIZE {
+            return false;
         }
-        Ok(())
+        let page_num = offset / PAGE_SIZE;
+        if page_num >= heap.get_page_map_len() {
+            return false;
+        }
+        let span = match heap.get_span_for_page(page_num) {
+            Some(span) => span,
+            None => return false,
+        };
+        let span_start = span.start_id.0;
+        if offset < span_start {
+            return false;
+        }
+        let offset_per_span = offset - span_start;
+        let block_size = span.size_class.block_size();
+        // ДОПОЛНИТЕЛЬНАЯ ЗАЩИТА: проверяем, указывает ли ObjectId строго на начало блока
+        if offset_per_span % block_size != 0 {
+            return false; // Указатель смещен внутрь объекта или поврежден
+        }
+        let index_per_span = offset_per_span / block_size;
+        // ЗАЩИТА ОТ ВЫХОДА ЗА ГРАНИЦЫ: проверяем емкость спана
+        if index_per_span >= span.total_blocks {
+            return false;
+        }
+        let mask_idx = index_per_span / 64;
+        let bit_pos = index_per_span % 64;
+        let mask = 1 << bit_pos;
+
+        // Атомарно взводим бит. fetch_or возвращает СТАРОЕ значение слова.
+        // Используем Release, чтобы гарантировать видимость наших действий другим потокам.
+        let old_val = span.marked_bits[mask_idx].fetch_or(mask, Ordering::Release);
+
+        // Если в старом значении на этой позиции был 0 — объект был Белым.
+        // Мы его успешно покрасили, возвращаем true (нужно добавить в worklist).
+        // Если там уже была 1 — объект Черный или Серый, возвращаем false (игнорируем).
+        (old_val & mask) == 0
     }
 
-    pub fn trace(&mut self, managed_heap: &mut ManagedHeap) -> Result<(), AllocError> {
-        while let Some(object_id) = self.worklist.pop() {
-            let mut header = managed_heap.read_header(object_id)?;
-            let references = managed_heap.read_references(object_id)?;
+    pub fn initialize(&mut self, roots: &[ObjectId], heap: &ManagedHeap) {
+        for root in roots {
+            if self.mark_object(*root, heap) {
+                self.worklist.push(*root);
+            }
+        }
+    }
 
-            for reference in references {
-                let mut reference = managed_heap.read_header(reference)?;
-                if reference.color == Black || reference.color == Grey {
-                    continue;
+    pub fn trace(&mut self, heap: &ManagedHeap) {
+        while let Some(obj_id) = self.worklist.pop() {
+            let refs = heap.read_references(obj_id);
+            for r in refs {
+                let child_id = ObjectId(*r as usize);
+                let marked = self.mark_object(child_id, heap);
+                if marked {
+                    self.worklist.push(child_id);
                 }
-                reference.color = Grey;
-                managed_heap.update_header(reference)?;
-                self.worklist.push(reference.id);
             }
-            header.color = Black;
-            managed_heap.update_header(header)?;
         }
-        Ok(())
     }
 
-    pub fn sweep(&mut self, managed_heap: &mut ManagedHeap) -> Result<(), AllocError> {
-        let mut object_id = ObjectId(0);
-        loop {
-            if managed_heap.over_next(object_id) {
-                break;
-            }
-            let mut header = managed_heap.read_header(object_id)?;
-            match header.color {
-                White => {
-                    header.refs_count = 0;
-                    managed_heap.update_header(header)?;
+    pub fn sweep(&mut self, heap: &ManagedHeap, central: &MCentral) {
+        let mut i = 0;
+        while i < heap.get_page_map_len() {
+            match heap.get_span_for_page(i) {
+                Some(span) => {
+                    span.sweep();
+                    i += span.size_class.pages_per_span();
                 }
-                Black => {
-                    header.color = White;
-                    managed_heap.update_header(header)?;
-                },
-                Grey => {}
+                None => i+=1,
             }
-
-            object_id = ObjectId(header.id.0 + header.size);
         }
-        Ok(())
+        central.sweep_full_spans()
     }
 
-    pub fn collect(&mut self, heap: &mut ManagedHeap, roots: &[ObjectId]) -> Result<(), AllocError> {
-        self.initialize(heap, roots)?;
-        self.trace(heap)?;
-        self.sweep(heap)?;
-        Ok(())
+    pub fn start_marking(&self) {
+        self.is_marking.store(true, Ordering::Release);
+    }
+
+    pub fn stop_marking(&self) {
+        self.is_marking.store(false, Ordering::Release);
+    }
+
+    pub fn drain_barrier_worklist(&self) -> Vec<ObjectId> {
+        let mut list = self.barrier_worklist.lock().unwrap();
+        std::mem::take(&mut *list)
     }
 }
