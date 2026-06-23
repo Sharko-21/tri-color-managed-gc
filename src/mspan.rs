@@ -106,8 +106,10 @@ impl MSpan {
     }
 
     pub fn is_full(&self) -> bool {
-        // Считаем сумму всех установленных в 1 битов во всех 4-х u64
-        let total_allocated: usize = self.alloc_bits
+        let bits_to_check = self.total_blocks.div_ceil(64);
+
+        // Считаем сумму установленных битов только в реально используемых словах
+        let total_allocated: usize = self.alloc_bits[..bits_to_check]
             .iter()
             .map(|word| word.load(Ordering::Acquire).count_ones() as usize)
             .sum();

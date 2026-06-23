@@ -152,7 +152,7 @@ fn main() {
     let num_threads = 8;
     // Снижаем количество аллокаций до 50 000, так как крупные объекты (3072) быстро съедают кучу.
     // 50 000 * 8 потоков = 400 000 разнородных объектов
-    let allocs_per_thread = 50_000;
+    let allocs_per_thread = 500_000;
     let total_allocs = num_threads * allocs_per_thread;
 
     // ----------------------------------------------------------------
@@ -160,7 +160,7 @@ fn main() {
     // ----------------------------------------------------------------
     println!("\n[Тест 4] Смешанный бенчмарк нашего Lock-Free аллокатора (Разные классы размеров)...");
 
-    let concurrent_heap = Arc::new(ManagedHeap::new(300 * 1024 * 1024)); // 300 MB
+    let concurrent_heap = Arc::new(ManagedHeap::new(6000 * 1024 * 1024)); // 600 MB
     let concurrent_central = Arc::new(MCentral::new());
 
     let mut handles = vec![];
@@ -253,5 +253,260 @@ fn main() {
         println!("📈 Системный аллокатор оказался быстрее нашего в {:.2} раз.", 1.0 / speedup);
     }
 
+    bench_fragmentation_recovery();
+    bench_gc_pause_scaling();
+    bench_single_thread_baseline();
+    bench_per_size_class();
+
     println!("\n🚀 Сравнение успешно завершено!");
+}
+
+// ============================================================
+// БЕНЧМАРК A: Fragmentation Recovery
+// Проверяет, реально ли занятая память (next_page_offset, через
+// прокси get_page_map_len) перестаёт расти после второй волны
+// аллокаций, если первая волна была наполовину собрана GC.
+// ============================================================
+fn bench_fragmentation_recovery() {
+    println!("\n[Бенч A] Fragmentation Recovery — переиспользование памяти после GC...");
+
+    let heap = Arc::new(ManagedHeap::new(64 * 1024 * 1024)); // 64 MB
+    let central = Arc::new(MCentral::new());
+    let mut cache = MCache::new(Arc::clone(&central), Arc::clone(&heap));
+    let mut gc = GarbageCollector::new();
+
+    let batch_size = 20_000usize;
+
+    // --- Волна 1: создаём batch_size объектов, половину делаем мусором ---
+    let mut roots: Vec<ObjectId> = Vec::new();
+    let mut garbage: Vec<ObjectId> = Vec::new();
+
+    for i in 0..batch_size {
+        let obj = ManagedObject {
+            type_desc_ptr: &LEAF_TYPE as *const _,
+            payload: vec![0xAA; 56],
+        };
+        let id = cache.alloc(MSpanSizeClass::B64, &obj).unwrap();
+        if i % 2 == 0 {
+            roots.push(id);
+        } else {
+            garbage.push(id);
+        }
+    }
+
+    let pages_after_wave1 = heap.get_page_map_len();
+    println!("   После волны 1: записей в page_map: {}", pages_after_wave1);
+
+    gc.initialize(&roots, &heap);
+    gc.trace(&heap);
+    gc.sweep(&heap, &central);
+
+    for id in &garbage {
+        assert!(!is_allocated(*id, &heap), "Мусор не был собран!");
+    }
+    for id in &roots {
+        assert!(is_allocated(*id, &heap), "Живой объект погиб ошибочно!");
+    }
+    println!("   [OK] Волна 1 мусора корректно собрана.");
+
+    // --- Волна 2: аллоцируем ещё столько же объектов того же класса ---
+    let mut roots2: Vec<ObjectId> = Vec::new();
+    for _ in 0..batch_size {
+        let obj = ManagedObject {
+            type_desc_ptr: &LEAF_TYPE as *const _,
+            payload: vec![0xBB; 56],
+        };
+        let id = cache.alloc(MSpanSizeClass::B64, &obj).unwrap();
+        roots2.push(id);
+    }
+
+    let pages_after_wave2 = heap.get_page_map_len();
+    println!("   После волны 2: записей в page_map: {}", pages_after_wave2);
+
+    // get_page_map_len — фиксированный размер вектора (heap_size / PAGE_SIZE + 1),
+    // он не растёт. Метрика роста, которую реально можно наблюдать —
+    // next_page_offset недоступен напрямую, поэтому считаем количество
+    // занятых страниц (страниц с Some(span)) до и после.
+    let occupied_after_wave1 = (0..pages_after_wave1)
+        .filter(|&i| heap.get_span_for_page(i).is_some())
+        .count();
+    let occupied_after_wave2 = (0..pages_after_wave2)
+        .filter(|&i| heap.get_span_for_page(i).is_some())
+        .count();
+
+    println!("   Занятых страниц после волны 1: {}", occupied_after_wave1);
+    println!("   Занятых страниц после волны 2: {}", occupied_after_wave2);
+
+    let growth = occupied_after_wave2.saturating_sub(occupied_after_wave1);
+    println!("   Прирост занятых страниц во второй волне: {}", growth);
+
+    // half of wave1 was garbage => роста почти не ожидаем, если recycling работает
+    if growth == 0 {
+        println!("   🎉 Память полностью переиспользована, новых страниц не выделено!");
+    } else {
+        println!("   ⚠️  Куча выросла на {} страниц несмотря на наличие свободных spans.", growth);
+    }
+
+    // не даём _roots2 быть warning'ом
+    let _ = roots2.len();
+}
+
+// ============================================================
+// БЕНЧМАРК B: GC pause time vs heap size (исправленная версия)
+// ============================================================
+fn bench_gc_pause_scaling() {
+    println!("\n[Бенч B] GC Pause Time vs Heap Size...");
+
+    let sizes = [10_000usize, 100_000, 500_000];
+
+    for &n in &sizes {
+        let heap = Arc::new(ManagedHeap::new((n * 128 + 4096).max(8 * 1024 * 1024)));
+        let central = Arc::new(MCentral::new());
+        let mut cache = MCache::new(Arc::clone(&central), Arc::clone(&heap));
+        let mut gc = GarbageCollector::new();
+
+        let mut roots = Vec::with_capacity(n);
+        for _ in 0..n {
+            let obj = ManagedObject {
+                type_desc_ptr: &LEAF_TYPE as *const _,
+                payload: vec![0xCC; 56],
+            };
+            roots.push(cache.alloc(MSpanSizeClass::B64, &obj).unwrap());
+        }
+
+        let start_init = Instant::now();
+        gc.initialize(&roots, &heap);
+        let init_time = start_init.elapsed();
+
+        let start_trace = Instant::now();
+        gc.trace(&heap);
+        let trace_time = start_trace.elapsed();
+
+        let start_sweep = Instant::now();
+        gc.sweep(&heap, &central);
+        let sweep_time = start_sweep.elapsed();
+
+        println!(
+            "   N={:>7} | initialize: {:>10?} | trace: {:>10?} | sweep: {:>10?} | итого: {:>10?}",
+            n,
+            init_time,
+            trace_time,
+            sweep_time,
+            init_time + trace_time + sweep_time
+        );
+
+        // sanity check — все объекты должны остаться живыми (все они root)
+        for id in &roots {
+            assert!(is_allocated(*id, &heap), "Живой root ошибочно собран!");
+        }
+    }
+}
+
+// ============================================================
+// БЕНЧМАРК C: Single-thread baseline
+// Тот же смешанный патторн аллокации (60/30/10%), что в тестах
+// 4/5, но в один поток — показывает, какую долю выигрыша даёт
+// именно sharded-lock конкурентность, а не сама by-себе арифметика.
+// ============================================================
+fn bench_single_thread_baseline() {
+    println!("\n[Бенч C] Single-thread baseline (наш аллокатор vs системный)...");
+
+    let allocs = 2_000_000usize;
+
+    // --- Наш аллокатор, один поток ---
+    let heap = Arc::new(ManagedHeap::new(1500 * 1024 * 1024));
+    let central = Arc::new(MCentral::new());
+    let mut cache = MCache::new(Arc::clone(&central), Arc::clone(&heap));
+
+    let start_custom = Instant::now();
+    for i in 0..allocs {
+        let (size_class, type_desc, payload_size) = if i % 10 == 0 {
+            (MSpanSizeClass::B3072, &LARGE_TYPE, 3064)
+        } else if i % 3 == 0 {
+            (MSpanSizeClass::B512, &MEDIUM_TYPE, 504)
+        } else {
+            (MSpanSizeClass::B64, &SMALL_TYPE, 56)
+        };
+        let obj = ManagedObject {
+            type_desc_ptr: type_desc as *const TypeDescriptor,
+            payload: vec![0u8; payload_size],
+        };
+        cache.alloc(size_class, &obj).unwrap();
+    }
+    let elapsed_custom = start_custom.elapsed();
+
+    // --- Системный аллокатор, один поток ---
+    let start_sys = Instant::now();
+    let mut heap_simulation = Vec::with_capacity(allocs);
+    for i in 0..allocs {
+        let block_size = if i % 10 == 0 {
+            3072
+        } else if i % 3 == 0 {
+            512
+        } else {
+            64
+        };
+        let payload_size = block_size - 8;
+        heap_simulation.push(vec![0u8; payload_size].into_boxed_slice());
+    }
+    let elapsed_sys = start_sys.elapsed();
+    let _ = heap_simulation.len();
+
+    println!("   Наш аллокатор (1 поток):      {:?}", elapsed_custom);
+    println!("   Системный аллокатор (1 поток): {:?}", elapsed_sys);
+
+    let speedup = elapsed_sys.as_secs_f64() / elapsed_custom.as_secs_f64();
+    if speedup > 1.0 {
+        println!("   🎉 В один поток наш быстрее в {:.2} раз — выигрыш не только от конкурентности.", speedup);
+    } else {
+        println!("   📈 В один поток системный быстрее в {:.2} раз — весь выигрыш в multi-thread от sharded locks.", 1.0 / speedup);
+    }
+}
+
+// ============================================================
+// БЕНЧМАРК D: Разбивка по size-классам
+// Показывает, на каких именно классах размеров разница больше всего.
+// ============================================================
+fn bench_per_size_class() {
+    println!("\n[Бенч D] Разбивка по size-классам (один поток, по 1M объектов каждого класса)...");
+
+    let classes = [
+        (MSpanSizeClass::B64, &SMALL_TYPE, 56usize, "B64"),
+        (MSpanSizeClass::B512, &MEDIUM_TYPE, 504usize, "B512"),
+        (MSpanSizeClass::B3072, &LARGE_TYPE, 3064usize, "B3072"),
+    ];
+
+    let allocs = 1_000_000usize;
+
+    for (size_class, type_desc, payload_size, label) in classes {
+        // ёмкость кучи с запасом под конкретный класс
+        let heap_size = (allocs * size_class.block_size()) + 16 * 1024 * 1024;
+        let heap = Arc::new(ManagedHeap::new(heap_size));
+        let central = Arc::new(MCentral::new());
+        let mut cache = MCache::new(Arc::clone(&central), Arc::clone(&heap));
+
+        let start_custom = Instant::now();
+        for _ in 0..allocs {
+            let obj = ManagedObject {
+                type_desc_ptr: &*type_desc as *const TypeDescriptor,
+                payload: vec![0u8; payload_size],
+            };
+            cache.alloc(size_class, &obj).unwrap();
+        }
+        let elapsed_custom = start_custom.elapsed();
+
+        let start_sys = Instant::now();
+        let mut sim = Vec::with_capacity(allocs);
+        for _ in 0..allocs {
+            sim.push(vec![0u8; payload_size].into_boxed_slice());
+        }
+        let elapsed_sys = start_sys.elapsed();
+        let _ = sim.len();
+
+        let speedup = elapsed_sys.as_secs_f64() / elapsed_custom.as_secs_f64();
+        println!(
+            "   {:<6} | наш: {:>10?} | системный: {:>10?} | speedup: {:.2}x",
+            label, elapsed_custom, elapsed_sys, speedup
+        );
+    }
 }

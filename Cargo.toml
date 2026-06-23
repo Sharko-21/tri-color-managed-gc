@@ -6,3 +6,5 @@ edition = "2024"
 [dependencies]
 strum = "0.28.0"
 strum_macros = "0.28.0"
+tikv-jemallocator = "0.6"
+mimalloc = "0.1"
